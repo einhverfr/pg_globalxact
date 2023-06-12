@@ -1,4 +1,6 @@
+#ifndef TPC_PHASE_H
 
+#define TPC_PHASE_H
 #include <libpq-fe.h>
 #include <postgres.h>
 
@@ -33,3 +35,5 @@ typedef enum {
 extern char * tpc_phase_get_label(tpc_phase phase);
 extern tpc_phase tpc_phase_from_label(const char *label);
 extern int tpc_phase_is_valid_transition(tpc_phase old_phase, tpc_phase new_phase);
+
+#endif

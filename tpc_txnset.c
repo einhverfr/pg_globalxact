@@ -37,32 +37,8 @@
 #undef foreach
 #define foreach(e, l) for ((e) = (l); (e); (e) = (e)->next)
 
-/*
- * We use an enriched single linked list to model the
- * transaction set here.
- *
- * For public usage, tpc_phase may be used to check
- * the results of rollback or commit.  COMPLETE means
- * that the transaction set was completed and cleaned up.
- *
- * INCOMPLETE means that the transaction set left dangling
- * transactions in places that must be externally cleaned up
- * and we don't want to wait around for them on the server.
- *
- * logpath gives you the path to the log file and the log
- * file descriptor will be closed after this point.
- */
 
-typedef struct tpc_txnset {
-   char logpath[TPC_LOGPATH_MAX];
-   FILE *log;
-   char txn_prefix[NAMEDATALEN]; /* overkill on size */
-   uint counter;
-   tpc_phase tpc_phase;
-   tpc_txn *head;
-   tpc_txn *latest;
-} tpc_txnset;
-
+void txn_cleanup(XactEvent event, void *arg);
 
 /*
  * tpc_txn may change without notice
@@ -70,7 +46,6 @@ typedef struct tpc_txnset {
 
 typedef struct tpc_txn {
    PGconn *cnx;                 /* connection to use */
-   char txn_name[NAMEDATALEN];  /* transaction name  */
    struct tpc_txn *next;
 } tpc_txn;
 
@@ -167,12 +142,37 @@ tpc_txnset_begin()
 	new_txnset->counter = 0;
 	new_txnset->head = NULL;
 	new_txnset->latest = NULL;
+	RegisterXactCallback(txn_cleanup, NULL);
 	MemoryContextSwitch(old_context);
 	return new_txnset;
 	
 }
 
+/* 
+ * static void cleanup()
+ * Deregisters the callback.
+ *
+ * Earlier versions also closed all connections
+ * but that is wasteful.
+ */
 
+static void
+cleanup(void)
+{
+
+    UnregisterXactCallback(txn_cleanup, NULL);
+    curr_txnset = NULL;
+}
+
+
+/* 
+ * static void rollback()
+ *
+ * For the current transaction set, rolls all remote connections back
+ * or at least tries to.  If the connection goes away and we have not
+ * prepared the transaction, we don't need to worry about things because
+ * the transaction will have disappeared too.
+ */
 
 static void
 rollback(void)
@@ -188,29 +188,86 @@ rollback(void)
     txnset = NULL;
 }
 
-/* 
- * static void cleanuo()
+/*
+ * Commits a transaction by name on a connection
  *
- * Closes all connections, for use
- * after the end of the transaction.
+ * After writes status (committed or error) as action in pending transaction 
+ * log.
+ *
+ * Records our error state for complete run.
  */
 
-static void
-cleanup(void)
+static tpc_phase
+tpc_commit(tpc_txnset *txnset)
 {
-    struct conn *curr;
+	bool can_complete = true;
 
-    if (!head)
-        return;
+	if (txnset->tpc_phase != PREPARE) {
+		ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				errmsg("Not in a valid phase of transaction")));
+	}
 
-    foreach (curr, head)
-        PQfinish(curr->pg);
+	txnset->tpc_phase = COMMIT;
+	tpc_txnsetfile_write_phase(txnset, COMMIT);
 
-    head = NULL;
-    conn = NULL;
-    UnregisterXactCallback(txn_cleanup, NULL);
+		
+	for(tpc_txn *curr = txnset->head; curr; curr = curr->next){
+		PGresult *res;
+		char commit_query[128];
+		snprintf(commit_query, sizeof(commit_query), 
+			commitfmt, curr->txn_name);
+		res = PQexec(curr->cnx, commit_query);
+
+		/* We are not allowed to throw errors here, but we can flag
+		 * the run as impossible to complete.
+		 */
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			can_complete = false;
+		tpc_txnsetfile_write_action(txnset, curr, COMMIT,
+				(PQresultStatus(res) == PGRES_COMMAND_OK
+				? "OK" : "BAD"));
+	}
+	complete(txnset, can_complete);
+	return txnset->tpc_phase;
 }
 
+/* 
+ * Rolls back the transaction by name on a connection
+ * Writes data to rollback segment of pending transaction log.
+ */
+static tpc_phase
+tpc_rollback(tpc_txnset *txnset)
+{
+	bool can_complete = true;
+
+	if (txnset->tpc_phase != PREPARE) {
+		ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				errmsg("Not in a valid phase of transaction")));
+	}
+
+	txnset->tpc_phase = ROLLBACK;
+	tpc_txnsetfile_write_phase(txnset, ROLLBACK);
+
+		
+	for(tpc_txn *curr = txnset->head; curr; curr = curr->next){
+		PGresult *res;
+		char rollback_query[128];
+		snprintf(rollback_query, sizeof(rollback_query), 
+			rollbackfmt, curr->txn_name);
+		res = PQexec(curr->cnx, rollback_query);
+
+		/* We are not allowed to throw errors here, but we can flag
+		 * the run as impossible to complete.
+		 */
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			can_complete = false;
+		tpc_txnsetfile_write_action(txnset, curr, ROLLBACK, 
+				(PQresultStatus(res) == PGRES_COMMAND_OK
+				? "OK" : "BAD"));
+	}
+	complete(txnset, can_complete);
+	return txnset->tpc_phase;
+}
 
 /* statuc void txn_ceanup(XactEvent event, void *arg)
  *
@@ -229,25 +286,22 @@ txn_cleanup(XactEvent event, void *arg)
         case XACT_EVENT_PRE_PREPARE:
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Two phase commit not supported yet")));
             break;
-#if PG_VERSION_NUM >= 90500
         case XACT_EVENT_PARALLEL_COMMIT:
-#endif
         case XACT_EVENT_COMMIT:
+	    /* The problem is that if something goes wrong, here it is too late
+	     * roll back.  Consequently this warning is because it is not safe.
+	     */
             ereport(WARNING,
                     (errmsg("%s", "you are committing a remote transaction implicitly.  This can cause problems.")));
 /* fall through for cleanup */
-#if PG_VERSION_NUM >= 90500
         case XACT_EVENT_PARALLEL_PRE_COMMIT:
-#endif
         case XACT_EVENT_PRE_COMMIT:
-            commit();
+            tpc_commit();
             cleanup();
             break;
-#if PG_VERSION_NUM >= 90500
         case XACT_EVENT_PARALLEL_ABORT:
-#endif
         case XACT_EVENT_ABORT:
-            rollback();
+            tpc_rollback();
             cleanup();
             break;
         default:
@@ -256,3 +310,26 @@ txn_cleanup(XactEvent event, void *arg)
     }
 }
 
+/*
+ * void tpc_txnset_register(PGconn * conn)
+ *
+ * Registers the txnset with the current global txnset.  If there is no current
+ * txnset, then one is created.
+ */
+
+void
+tpc_txnset_register(PGConn * conn)
+{
+	tpc_txn *txn = palloc(sizeof(tpc_txn));
+	txn->next = NULL;
+	txn->conn = conn;
+	if (NULL == txnset) {
+		tpc_txnset_begin();
+		txnset->head = txn;
+		txnset->latest = txn;
+	}
+	} else {
+		txnset->latest->next = txn;
+		txnset->latest = txn;
+	}
+}
