@@ -34,11 +34,18 @@
 
 
 #include "tpc_txnset.h"
+#include <utils/uuid.h>
+#include <utils/memutils.h>
 #undef foreach
 #define foreach(e, l) for ((e) = (l); (e); (e) = (e)->next)
 
 
-void txn_cleanup(XactEvent event, void *arg);
+extern void tpc_txnsetfile_start(tpc_txnset *txnset, const char *local_globalid);
+extern void tpc_txnsetfile_write_phase(tpc_txnset *txnset, tpc_phase next_phase);
+extern void tpc_txnsetfile_write_action(tpc_txnset *txnset, tpc_txn *txn, const char *action);
+extern void tpc_txnsetfile_complete(tpc_txnset *txnset);
+  
+static void txn_cleanup(XactEvent event, void * arg);
 
 /*
  * tpc_txn may change without notice
@@ -48,6 +55,10 @@ typedef struct tpc_txn {
    PGconn *cnx;                 /* connection to use */
    struct tpc_txn *next;
 } tpc_txn;
+
+const static char preparefmt[] = "PREPARE TRANSACTION '%s'";
+const static char commitfmt[] = "COMMIT PREPARED '%s'";
+const static char rollbackfmt[] = "ROLLBACK PREPARED '%s'";
 
 
 /* backend global variable curr_txnset
@@ -70,8 +81,8 @@ tpc_txnset *curr_txnset = NULL;
  * for use in C.
  */
 
-static inline *pg_uuid_t
-gen_uuid()
+static pg_uuid_t *
+gen_uuid(void)
 {
 	pg_uuid_t  *uuid = palloc(UUID_LEN);
 
@@ -89,7 +100,7 @@ gen_uuid()
 	return uuid;
 }
 
-static inline *char
+static inline char *
 uuid_to_str(pg_uuid_t *uuid)
 {
 	static const char hex_chars[] = "0123456789abcdef";
@@ -123,7 +134,7 @@ tpc_txnset *
 tpc_txnset_begin()
 {
 	/* errors are safe here since the transaction will be aborted */
-	MemoryContext old_context = MemoryContextSwitch(CurTransactionContext);
+	MemoryContext old_context = MemoryContextSwitchTo(CurTransactionContext);
 
 	tpc_txnset *new_txnset;
 	new_txnset = palloc0(sizeof(tpc_txnset));
@@ -135,15 +146,15 @@ tpc_txnset_begin()
 	 * systems....
 	 */
 	new_txnset->tpc_phase = BEGIN;
-	tpc_txnfile_write_state(new_txnset, BEGIN);
-	snprintf(new_txnset->txn_prefix, sizeof(new_txnset->txn_prefix),
+	tpc_txnsetfile_write_phase(new_txnset, BEGIN);
+	snprintf(new_txnset->txn_prefix, sizeof(new_txnset->txn_prefix), "%s",
 		uuid_to_str(gen_uuid()));
-	tpc_txnsetfile_begin(new_txnset, new_txnset->txn_prefix);
+	tpc_txnsetfile_start(new_txnset, new_txnset->txn_prefix);
 	new_txnset->counter = 0;
 	new_txnset->head = NULL;
 	new_txnset->latest = NULL;
 	RegisterXactCallback(txn_cleanup, NULL);
-	MemoryContextSwitch(old_context);
+	MemoryContextSwitchTo(old_context);
 	return new_txnset;
 	
 }
@@ -165,28 +176,6 @@ cleanup(void)
 }
 
 
-/* 
- * static void rollback()
- *
- * For the current transaction set, rolls all remote connections back
- * or at least tries to.  If the connection goes away and we have not
- * prepared the transaction, we don't need to worry about things because
- * the transaction will have disappeared too.
- */
-
-static void
-rollback(void)
-{
-    struct conn *curr;
-
-    if (!head)
-        return;
-    if (txnset)
-        tpc_rollback(txnset);
-    foreach (curr, head)
-        execorerr(curr, "ROLLBACK;", false);
-    txnset = NULL;
-}
 
 /*
  * Commits a transaction by name on a connection
@@ -198,24 +187,25 @@ rollback(void)
  */
 
 static tpc_phase
-tpc_commit(tpc_txnset *txnset)
+tpc_commit()
 {
+	tpc_txnset *txnset = curr_txnset;
 	bool can_complete = true;
 
-	if (txnset->tpc_phase != PREPARE) {
+	if (curr_txnset->tpc_phase != PREPARE) {
 		ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				errmsg("Not in a valid phase of transaction")));
 	}
 
-	txnset->tpc_phase = COMMIT;
-	tpc_txnsetfile_write_phase(txnset, COMMIT);
+	curr_txnset->tpc_phase = COMMIT;
+	tpc_txnsetfile_write_phase(curr_txnset, COMMIT);
 
 		
-	for(tpc_txn *curr = txnset->head; curr; curr = curr->next){
+	for(tpc_txn *curr = curr_txnset->head; curr; curr = curr->next){
 		PGresult *res;
 		char commit_query[128];
 		snprintf(commit_query, sizeof(commit_query), 
-			commitfmt, curr->txn_name);
+			commitfmt, curr_txnset->txn_prefix);
 		res = PQexec(curr->cnx, commit_query);
 
 		/* We are not allowed to throw errors here, but we can flag
@@ -223,12 +213,12 @@ tpc_commit(tpc_txnset *txnset)
 		 */
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			can_complete = false;
-		tpc_txnsetfile_write_action(txnset, curr, COMMIT,
+		tpc_txnsetfile_write_action(curr_txnset, curr,
 				(PQresultStatus(res) == PGRES_COMMAND_OK
 				? "OK" : "BAD"));
 	}
-	complete(txnset, can_complete);
-	return txnset->tpc_phase;
+	complete(curr_txnset, can_complete);
+	return curr_txnset->tpc_phase;
 }
 
 /* 
@@ -236,24 +226,24 @@ tpc_commit(tpc_txnset *txnset)
  * Writes data to rollback segment of pending transaction log.
  */
 static tpc_phase
-tpc_rollback(tpc_txnset *txnset)
+tpc_rollback()
 {
 	bool can_complete = true;
 
-	if (txnset->tpc_phase != PREPARE) {
+	if (curr_txnset->tpc_phase != PREPARE) {
 		ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				errmsg("Not in a valid phase of transaction")));
 	}
 
-	txnset->tpc_phase = ROLLBACK;
-	tpc_txnsetfile_write_phase(txnset, ROLLBACK);
+	curr_txnset->tpc_phase = ROLLBACK;
+	tpc_txnsetfile_write_phase(curr_txnset, ROLLBACK);
 
 		
-	for(tpc_txn *curr = txnset->head; curr; curr = curr->next){
+	for(tpc_txn *curr = curr_txnset->head; curr; curr = curr->next){
 		PGresult *res;
 		char rollback_query[128];
 		snprintf(rollback_query, sizeof(rollback_query), 
-			rollbackfmt, curr->txn_name);
+			rollbackfmt, curr_txnset->txn_prefix);
 		res = PQexec(curr->cnx, rollback_query);
 
 		/* We are not allowed to throw errors here, but we can flag
@@ -261,12 +251,12 @@ tpc_rollback(tpc_txnset *txnset)
 		 */
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			can_complete = false;
-		tpc_txnsetfile_write_action(txnset, curr, ROLLBACK, 
+		tpc_txnsetfile_write_action(curr_txnset, curr, 
 				(PQresultStatus(res) == PGRES_COMMAND_OK
 				? "OK" : "BAD"));
 	}
-	complete(txnset, can_complete);
-	return txnset->tpc_phase;
+	complete(curr_txnset, can_complete);
+	return curr_txnset->tpc_phase;
 }
 
 /* statuc void txn_ceanup(XactEvent event, void *arg)
@@ -318,18 +308,17 @@ txn_cleanup(XactEvent event, void *arg)
  */
 
 void
-tpc_txnset_register(PGConn * conn)
+tpc_txnset_register(PGconn * conn)
 {
 	tpc_txn *txn = palloc(sizeof(tpc_txn));
 	txn->next = NULL;
-	txn->conn = conn;
-	if (NULL == txnset) {
+	txn->cnx = conn;
+	if (NULL == curr_txnset) {
 		tpc_txnset_begin();
-		txnset->head = txn;
-		txnset->latest = txn;
-	}
+		curr_txnset->head = txn;
+		curr_txnset->latest = txn;
 	} else {
-		txnset->latest->next = txn;
-		txnset->latest = txn;
+		curr_txnset->latest->next = txn;
+		curr_txnset->latest = txn;
 	}
 }

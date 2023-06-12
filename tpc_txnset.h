@@ -5,12 +5,9 @@
 #include <libpq-fe.h>
 #include <postgres.h>
 #include "tpc_phase.h"
+#include <access/xact.h>
 
 #define TPC_LOGPATH_MAX 255
-
-extern tpc_txnset * tpc_begin(char *prefix);
-extern void tpc_register_cnx(PGconn *cnx);
-extern void tpc_process_file(char *fname);
 
 /* putting the tpc_txnset struct/typedef here
  * because of the fact that whatever tracks state needs
@@ -33,6 +30,8 @@ extern void tpc_process_file(char *fname);
  * file descriptor will be closed after this point.
  */
 
+typedef struct tpc_txn tpc_txn;
+
 typedef struct tpc_txnset {
    char logpath[TPC_LOGPATH_MAX];
    FILE *log;
@@ -43,4 +42,8 @@ typedef struct tpc_txnset {
    tpc_txn *latest;
 } tpc_txnset;
 
+
+extern tpc_txnset * tpc_begin(char *prefix);
+extern void tpc_register_cnx(PGconn *cnx);
+extern void tpc_process_file(char *fname);
 #endif
