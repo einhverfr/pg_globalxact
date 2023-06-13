@@ -25,7 +25,7 @@
  *
  */
 
-#include "twophasecommit.h"
+#include "tpc-txnset.h"
 #include <libpq-fe.h>
 #include <stdio.h>
 #include <postgres.h>
@@ -55,6 +55,10 @@ void tpc_txnsetfile_complete(tpc_txnset *txnset);
  * and loads the transaction set into memory from the file.  This is
  * used to load the file for the background worker, as well as for 
  * administrator commands.
+ *
+ * This operates in whatever the memory context is current when the
+ * function was called.  This allows it to be called in set returning
+ * functions for monitoring distributed transaction state.
  */
 
 tpc_txnset 
