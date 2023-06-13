@@ -16,21 +16,21 @@
 #define false 0
 
 static char phase_labels[6][10] = {
-	"begin",
-	"prepare",
-	"commit",
-	"rollback",
-	"complete",
-	"incomplete"
+    "begin",
+    "prepare",
+    "commit",
+    "rollback",
+    "complete",
+    "incomplete"
 };
 
 const static tpc_phase phases[] = {
-	BEGIN,
-	PREPARE,
-	COMMIT,
-	ROLLBACK,
-	COMPLETE,
-	INCOMPLETE
+    BEGIN,
+    PREPARE,
+    COMMIT,
+    ROLLBACK,
+    COMPLETE,
+    INCOMPLETE
 };
 
 
@@ -42,16 +42,15 @@ const static tpc_phase phases[] = {
  * If the phase is not found, an error is thrown.
  */
 
-tpc_phase 
-tpc_phase_from_label(const char *label)
-{
-	for (int i = 0; i< 7; ++i){
-		if (strcmp(label, phase_labels[i]) == 0) {
-			return phases[i];
-		}
+tpc_phase
+tpc_phase_from_label(const char *label) {
+    for (int i = 0; i < 7; ++i) {
+	if (strcmp(label, phase_labels[i]) == 0) {
+	    return phases[i];
 	}
-	ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE), errmsg("invalid txn phase %s", 
-				                 label)));
+    }
+    ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE), errmsg("invalid txn phase %s",
+		label)));
 }
 
 /*
@@ -60,13 +59,13 @@ tpc_phase_from_label(const char *label)
  * phase via a lookup table. This is not intended to be used
  * outside this file, hence the static designation.
  */
-char* 
+char	   *
 tpc_phase_get_label(tpc_phase phase)
 {
-	for (int i = 0; i< 7; ++i){
-		if (phases[i] == phase)
-			return phase_labels[i];
-	}
+    for (int i = 0; i < 7; ++i) {
+	if (phases[i] == phase)
+	    return phase_labels[i];
+    }
 }
 
 
@@ -82,30 +81,29 @@ tpc_phase_get_label(tpc_phase phase)
 int
 tpc_phase_is_valid_transition(tpc_phase old_phase, tpc_phase new_phase)
 {
-	switch(old_phase)
-	{
-		case BEGIN:
-			if (PREPARE == new_phase)
-				return true;
-			else
-				return false;
-		case PREPARE:
-			if (COMMIT == new_phase || ROLLBACK == new_phase)
-				return true;
-			else
-				return false;
-		case COMMIT:
-		case ROLLBACK:
-			if (COMPLETE == new_phase || INCOMPLETE == new_phase)
-				return true;
-			else
-				return false;
-		case INCOMPLETE:
-			if (COMPLETE == new_phase)
-				return true;
-			else
-				return false;
-		default:
-			return false;
-	}
+    switch (old_phase) {
+    case BEGIN:
+	if (PREPARE == new_phase)
+	    return true;
+	else
+	    return false;
+    case PREPARE:
+	if (COMMIT == new_phase || ROLLBACK == new_phase)
+	    return true;
+	else
+	    return false;
+    case COMMIT:
+    case ROLLBACK:
+	if (COMPLETE == new_phase || INCOMPLETE == new_phase)
+	    return true;
+	else
+	    return false;
+    case INCOMPLETE:
+	if (COMPLETE == new_phase)
+	    return true;
+	else
+	    return false;
+    default:
+	return false;
+    }
 }

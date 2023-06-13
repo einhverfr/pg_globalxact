@@ -33,17 +33,17 @@
 typedef struct tpc_txn tpc_txn;
 
 typedef struct tpc_txnset {
-   char logpath[TPC_LOGPATH_MAX];
-   FILE *log;
-   char txn_prefix[NAMEDATALEN]; /* overkill on size */
-   uint counter;
-   tpc_phase tpc_phase;
-   tpc_txn *head;
-   tpc_txn *latest;
-} tpc_txnset;
+    char	logpath[TPC_LOGPATH_MAX];
+    FILE       *log;
+    char	txn_prefix[NAMEDATALEN];	/* overkill on size */
+    uint	counter;
+    tpc_phase	tpc_phase;
+    tpc_txn    *head;
+    tpc_txn    *latest;
+}	    tpc_txnset;
 
 
 extern tpc_txnset * tpc_begin(char *prefix);
-extern void tpc_register_cnx(PGconn *cnx);
+extern void tpc_register_cnx(PGconn * cnx);
 extern void tpc_process_file(char *fname);
 #endif
