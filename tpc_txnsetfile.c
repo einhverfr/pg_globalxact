@@ -33,6 +33,8 @@
 #include <sys/stat.h>
 #include <utils/builtins.h>
 
+PG_MODULE_MAGIC;
+
 const static char phasefmt[] = "phase %s\n";
 const static char actionfmt[] = "%s postgresql://%s:%s/%s %s %s\n";
 const static char getactionfmt[] = "%s %s %s %s";
@@ -244,18 +246,51 @@ tpc_cleanup_txnset(PG_FUNCTION_ARGS) {
 typedef struct info_line {
     char       *host, int port, char *database, char *status_label
 };
+
+
+
 PG_FUNCTION_INFO_V1(tpc_txnset_contents);
+
+/* State so we don't have to keep re-reading the file for each line */
+tpc_txnset func_state_txnset;
 
 Datum
 tpc_txnset_contents(PG_FUNCTION_ARGS) {
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    MemoryContext per_query_ctx;
+    MemoryContext oldcontext;
+    info_line  return_next;
+    tpc_txnset *txnset = &func_state_txnset;
+    tpc_txnset *txnset_new;
+    char *gtlxid = PG_GETARG_CSTRING(0);
+
+    /* check to see if caller supports us returning a tuplestore */
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+	ereport(ERROR,
+	    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+	ereport(ERROR,
+	    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		errmsg("materialize mode required, but it is not allowed in this context")));
+
     /*
      * need to set up per statement memory context here for the txnset
      */
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+    if (SRF_IS_FIRSTCALL()){
+    	txnset_new = tpc_txnset_fromIfile(gtlxid);
+	memcpy(txnset, txnset_new, sizeof(txnset));
+    }
 
     /*
      * For each transaction we return the tuple structure
      */
-
+    for .... {
+        info_line.host info_line.port info_line.database info_line.status_label;
+    }
     /* Finally, close, and return end */
 }
