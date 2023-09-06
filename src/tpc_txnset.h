@@ -30,7 +30,10 @@
  * file descriptor will be closed after this point.
  */
 
-typedef struct tpc_txn tpc_txn;
+typedef struct tpc_txn {
+   PGconn *conn;
+   struct tpc_txn *next;
+} tpc_txn;
 
 typedef struct tpc_txnset {
     char	logpath[TPC_LOGPATH_MAX];
@@ -43,7 +46,9 @@ typedef struct tpc_txnset {
 }	    tpc_txnset;
 
 
+
 extern tpc_txnset * tpc_begin(char *prefix);
 extern void tpc_register_cnx(PGconn * cnx);
 extern void tpc_process_file(char *fname);
+extern void tpc_txnset_register(PGconn * conn);
 #endif

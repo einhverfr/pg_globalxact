@@ -24,7 +24,7 @@ static char phase_labels[6][10] = {
     "incomplete"
 };
 
-const static tpc_phase phases[] = {
+static const tpc_phase phases[] = {
     BEGIN,
     PREPARE,
     COMMIT,
@@ -66,6 +66,7 @@ tpc_phase_get_label(tpc_phase phase)
 	if (phases[i] == phase)
 	    return phase_labels[i];
     }
+    return NULL; // should never happen
 }
 
 

@@ -25,7 +25,7 @@
  *
  */
 
-#include "tpc-txnset.h"
+#include "tpc_txnset.h"
 #include <libpq-fe.h>
 #include <stdio.h>
 #include <postgres.h>
@@ -35,10 +35,10 @@
 
 PG_MODULE_MAGIC;
 
-const static char phasefmt[] = "phase %s\n";
-const static char actionfmt[] = "%s postgresql://%s:%s/%s %s %s\n";
-const static char getactionfmt[] = "%s %s %s %s";
-const static char dirpath[] = "extglobalxact";
+static const char phasefmt[] = "phase %s\n";
+static const char actionfmt[] = "%s postgresql://%s:%s/%s %s %s\n";
+static const char getactionfmt[] = "%s %s %s %s";
+static const char dirpath[] = "extglobalxact";
 
 /*Max length of file line.  Going with 512 becaus connection strings in theory could be up to 255 characters long.
  */
@@ -251,16 +251,18 @@ typedef struct info_line {
 
 PG_FUNCTION_INFO_V1(tpc_txnset_contents);
 
-/* State so we don't have to keep re-reading the file for each line */
-tpc_txnset func_state_txnset;
-
+/* State so we don't have to keep re-reading the file for each line
+ * Using value_per_call mode here.  It is not terribly hard to do it
+ * in this case.  Right now this still doesn't work (still needs
+ * some of the tuple constructor parts done).  But will be completed
+ * soon, after basic test programs are done.
+ */
 Datum
 tpc_txnset_contents(PG_FUNCTION_ARGS) {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
     MemoryContext per_query_ctx;
     MemoryContext oldcontext;
     info_line  return_next;
-    tpc_txnset *txnset = &func_state_txnset;
     tpc_txnset *txnset_new;
     char *gtlxid = PG_GETARG_CSTRING(0);
 
@@ -282,6 +284,8 @@ tpc_txnset_contents(PG_FUNCTION_ARGS) {
     oldcontext = MemoryContextSwitchTo(per_query_ctx);
 
     if (SRF_IS_FIRSTCALL()){
+        functx = SRF_FIRSTCALL_INIT();
+	txnset_new = palloc(sizeof tpc_txnset);
     	txnset_new = tpc_txnset_fromIfile(gtlxid);
 	memcpy(txnset, txnset_new, sizeof(txnset));
     }
@@ -289,8 +293,10 @@ tpc_txnset_contents(PG_FUNCTION_ARGS) {
     /*
      * For each transaction we return the tuple structure
      */
-    for .... {
-        info_line.host info_line.port info_line.database info_line.status_label;
-    }
+    //if (
+        // build the tuple and return it
+    //    info_line.host info_line.port info_line.database info_line.status_label;
     /* Finally, close, and return end */
+    MemoryContextSwitchTo(old_context);
+    SRF_RETURN_DONE(per_query_ctx);
 }
