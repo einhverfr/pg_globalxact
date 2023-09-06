@@ -6,6 +6,7 @@
 #include <postgres.h>
 #include "tpc_phase.h"
 #include <access/xact.h>
+#include <funcapi.h>
 
 #define TPC_LOGPATH_MAX 255
 
@@ -47,7 +48,7 @@ typedef struct tpc_txnset {
 
 
 
-extern tpc_txnset * tpc_begin(char *prefix);
+extern void tpc_begin(void);
 extern void tpc_register_cnx(PGconn * cnx);
 extern void tpc_process_file(char *fname);
 extern void tpc_txnset_register(PGconn * conn);

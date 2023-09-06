@@ -1,4 +1,8 @@
 #include "tpc_txnset.h"
+#include <utils/uuid.h>
+
+#undef foreach
+#define foreach(e, l) for ((e) = (l); (e); (e) = (e)->next)
 
 
 /* 
@@ -17,6 +21,9 @@ tpc_txnset * txnset = NULL;
 void
 tpc_txnset_register(PGconn * conn)
 {
+	/* errors are safe here since the transaction will be aborted */
+	MemoryContext old_context = MemoryContextSwitchTo(CurTransactionContext);
+
 	tpc_txn *txn = palloc0(sizeof(tpc_txn));
 	txn->next = NULL;
 	txn->conn = conn;
@@ -24,11 +31,12 @@ tpc_txnset_register(PGconn * conn)
 		tpc_begin();
 		txnset->head = txn;
 		txnset->latest = txn;
-	}
 	} else {
 		txnset->latest->next = txn;
 		txnset->latest = txn;
 	}
+	RegisterXactCallback(txn_cleanup, NULL);
+	MemoryContextSwitchTo(old_context);
 }
 
 /* 
@@ -43,7 +51,7 @@ tpc_txnset_register(PGconn * conn)
  * for use in C.
  */
 
-static inline *pg_uuid_t
+static inline pg_uuid_t *
 gen_uuid()
 {
 	pg_uuid_t  *uuid = palloc(UUID_LEN);
@@ -62,7 +70,7 @@ gen_uuid()
 	return uuid;
 }
 
-static inline *char
+static inline char *
 uuid_to_str(pg_uuid_t *uuid)
 {
 	static const char hex_chars[] = "0123456789abcdef";
@@ -100,7 +108,7 @@ uuid_to_str(pg_uuid_t *uuid)
  * The description (txn_prefix) is set to a UUID.
  */
 
-tpc_txnset *
+void
 tpc_begin() {
     tpc_txnset txnset = palloc0(sizeof tpc_txnset);
     snprintf(txnset->txn_prefix, sizeof(txnset->txn_prefix),
@@ -133,12 +141,14 @@ cleanup(void)
  * the transaction will have disappeared too.
  */
 
-static void
+void
 rollback(void)
 {
     struct conn *curr;
+    struct conn *head = txnset->head;
 
-    if (!head)
+
+    if (NULL == head)
         return;
     if (txnset)
         tpc_rollback(txnset);
@@ -147,124 +157,3 @@ rollback(void)
     txnset = NULL;
 }
 
-/*
- * Commits a transaction by name on a connection
- *
- * After writes status (committed or error) as action in pending transaction 
- * log.
- *
- * Records our error state for complete run.
- */
-
-static tpc_phase
-tpc_commit(tpc_txnset *txnset)
-{
-	bool can_complete = true;
-
-	if (txnset->tpc_phase != PREPARE) {
-		ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				errmsg("Not in a valid phase of transaction")));
-	}
-
-	txnset->tpc_phase = COMMIT;
-	tpc_txnsetfile_write_phase(txnset, COMMIT);
-
-		
-	for(tpc_txn *curr = txnset->head; curr; curr = curr->next){
-		PGresult *res;
-		char commit_query[128];
-		snprintf(commit_query, sizeof(commit_query), 
-			commitfmt, curr->txn_name);
-		res = PQexec(curr->cnx, commit_query);
-
-		/* We are not allowed to throw errors here, but we can flag
-		 * the run as impossible to complete.
-		 */
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			can_complete = false;
-		tpc_txnsetfile_write_action(txnset, curr, COMMIT,
-				(PQresultStatus(res) == PGRES_COMMAND_OK
-				? "OK" : "BAD"));
-	}
-	complete(txnset, can_complete);
-	return txnset->tpc_phase;
-}
-
-/* 
- * Rolls back the transaction by name on a connection
- * Writes data to rollback segment of pending transaction log.
- */
-static tpc_phase
-tpc_rollback(tpc_txnset *txnset)
-{
-	bool can_complete = true;
-
-	if (txnset->tpc_phase != PREPARE) {
-		ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				errmsg("Not in a valid phase of transaction")));
-	}
-
-	txnset->tpc_phase = ROLLBACK;
-	tpc_txnsetfile_write_phase(txnset, ROLLBACK);
-
-		
-	for(tpc_txn *curr = txnset->head; curr; curr = curr->next){
-		PGresult *res;
-		char rollback_query[128];
-		snprintf(rollback_query, sizeof(rollback_query), 
-			rollbackfmt, curr->txn_name);
-		res = PQexec(curr->cnx, rollback_query);
-
-		/* We are not allowed to throw errors here, but we can flag
-		 * the run as impossible to complete.
-		 */
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			can_complete = false;
-		tpc_txnsetfile_write_action(txnset, curr, ROLLBACK, 
-				(PQresultStatus(res) == PGRES_COMMAND_OK
-				? "OK" : "BAD"));
-	}
-	complete(txnset, can_complete);
-	return txnset->tpc_phase;
-}
-
-/* statuc void txn_ceanup(XactEvent event, void *arg)
- *
- * This is the primary event handler for commit and
- * rollback.  It hides the tpc semantics behind those of
- * the local transactional semantics.
- */
-
-
-static void
-txn_cleanup(XactEvent event, void *arg)
-{
-    switch (event)
-    {
-        case XACT_EVENT_PREPARE:
-        case XACT_EVENT_PRE_PREPARE:
-            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Two phase commit not supported yet")));
-            break;
-        case XACT_EVENT_PARALLEL_COMMIT:
-        case XACT_EVENT_COMMIT:
-	    /* The problem is that if something goes wrong, here it is too late
-	     * roll back.  Consequently this warning is because it is not safe.
-	     */
-            ereport(WARNING,
-                    (errmsg("%s", "you are committing a remote transaction implicitly.  This can cause problems.")));
-/* fall through for cleanup */
-        case XACT_EVENT_PARALLEL_PRE_COMMIT:
-        case XACT_EVENT_PRE_COMMIT:
-            tpc_commit();
-            cleanup();
-            break;
-        case XACT_EVENT_PARALLEL_ABORT:
-        case XACT_EVENT_ABORT:
-            tpc_rollback();
-            cleanup();
-            break;
-        default:
-            /* ignore */
-            break;
-    }
-}

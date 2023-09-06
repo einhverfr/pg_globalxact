@@ -300,3 +300,126 @@ tpc_txnset_contents(PG_FUNCTION_ARGS) {
     MemoryContextSwitchTo(old_context);
     SRF_RETURN_DONE(per_query_ctx);
 }
+
+/* 
+ * Rolls back the transaction by name on a connection
+ * Writes data to rollback segment of pending transaction log.
+ */
+static tpc_phase
+tpc_rollback()
+{
+	bool can_complete = true;
+
+	if (txnset->tpc_phase != PREPARE) {
+		ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				errmsg("Not in a valid phase of transaction")));
+	}
+
+	txnset->tpc_phase = ROLLBACK;
+	tpc_txnsetfile_write_phase(txnset, ROLLBACK);
+
+		
+	for(tpc_txn *curr = txnset->head; curr; curr = curr->next){
+		PGresult *res;
+		char rollback_query[128];
+		snprintf(rollback_query, sizeof(rollback_query), 
+			rollbackfmt, curr->txn_name);
+		res = PQexec(curr->cnx, rollback_query);
+
+		/* We are not allowed to throw errors here, but we can flag
+		 * the run as impossible to complete.
+		 */
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			can_complete = false;
+		tpc_txnsetfile_write_action(txnset, curr, ROLLBACK, 
+				(PQresultStatus(res) == PGRES_COMMAND_OK
+				? "OK" : "BAD"));
+	}
+	complete(txnset, can_complete);
+	return txnset->tpc_phase;
+}
+
+/* statuc void txn_ceanup(XactEvent event, void *arg)
+ *
+ * This is the primary event handler for commit and
+ * rollback.  It hides the tpc semantics behind those of
+ * the local transactional semantics.
+ */
+
+
+static void
+txn_cleanup(XactEvent event, void *arg)
+{
+    switch (event)
+    {
+        case XACT_EVENT_PREPARE:
+        case XACT_EVENT_PRE_PREPARE:
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Two phase commit not supported yet")));
+            break;
+        case XACT_EVENT_PARALLEL_COMMIT:
+        case XACT_EVENT_COMMIT:
+	    /* The problem is that if something goes wrong, here it is too late
+	     * roll back.  Consequently this warning is because it is not safe.
+	     */
+            ereport(WARNING,
+                    (errmsg("%s", "you are committing a remote transaction implicitly.  This can cause problems.")));
+/* fall through for cleanup */
+        case XACT_EVENT_PARALLEL_PRE_COMMIT:
+        case XACT_EVENT_PRE_COMMIT:
+            tpc_commit();
+            cleanup();
+            break;
+        case XACT_EVENT_PARALLEL_ABORT:
+        case XACT_EVENT_ABORT:
+            tpc_rollback();
+            cleanup();
+            break;
+        default:
+            /* ignore */
+            break;
+    }
+}
+
+/*
+ * Commits a transaction by name on a connection
+ *
+ * After writes status (committed or error) as action in pending transaction 
+ * log.
+ *
+ * Records our error state for complete run.
+ */
+
+tpc_phase
+tpc_commit()
+{
+	bool can_complete = true;
+
+	if (txnset->tpc_phase != PREPARE) {
+		ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				errmsg("Not in a valid phase of transaction")));
+	}
+
+	txnset->tpc_phase = COMMIT;
+	tpc_txnsetfile_write_phase(txnset, COMMIT);
+
+		
+	for(tpc_txn *curr = txnset->head; curr; curr = curr->next){
+		PGresult *res;
+		char commit_query[128];
+		snprintf(commit_query, sizeof(commit_query), 
+			commitfmt, curr->txn_name);
+		res = PQexec(curr->conn, commit_query);
+
+		/* We are not allowed to throw errors here, but we can flag
+		 * the run as impossible to complete.
+		 */
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			can_complete = false;
+		tpc_txnsetfile_write_action(txnset, curr, COMMIT,
+				(PQresultStatus(res) == PGRES_COMMAND_OK
+				? "OK" : "BAD"));
+	}
+	complete(txnset, can_complete);
+	return txnset->tpc_phase;
+}
+
