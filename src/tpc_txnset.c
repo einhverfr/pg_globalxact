@@ -4,6 +4,8 @@
 #undef foreach
 #define foreach(e, l) for ((e) = (l); (e); (e) = (e)->next)
 
+static void txn_cleanup(XactEvent event, void *arg);
+static void cleanup(void);
 
 /* 
  * tpc_txnset for local connections is initialized to NULL at first.
@@ -110,9 +112,55 @@ uuid_to_str(pg_uuid_t *uuid)
 
 void
 tpc_begin() {
-    tpc_txnset txnset = palloc0(sizeof tpc_txnset);
-    snprintf(txnset->txn_prefix, sizeof(txnset->txn_prefix),
-                uuid_to_str(gen_uuid()));
+    MemoryContext old_context = MemoryContextSwitchTo(CurTransactionContext);
+    txnset = (tpc_txnset *) palloc0(sizeof(tpc_txnset));
+    strncpy(txnset->txn_prefix,  uuid_to_str(gen_uuid()), 
+           sizeof(txnset->txn_prefix));
+    MemoryContextSwitchTo(old_context);
+}
+
+/* static void txn_ceanup(XactEvent event, void *arg)
+ *
+ * This is the primary event handler for commit and
+ * rollback.  It hides the tpc semantics behind those of
+ * the local transactional semantics.
+ */
+
+
+static void
+txn_cleanup(XactEvent event, void *arg)
+{
+    switch (event)
+    {
+        case XACT_EVENT_PREPARE:
+	    // fall through
+        case XACT_EVENT_PRE_PREPARE:
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Two phase commit not supported yet")));
+            break;
+        case XACT_EVENT_PARALLEL_COMMIT:
+        case XACT_EVENT_COMMIT:
+	    /* The problem is that if something goes wrong, here it is too late
+	     * roll back.  Consequently this warning is because it is not safe.
+	     */
+            ereport(WARNING,
+                    (errmsg("%s", "you are committing a remote transaction implicitly.  This can cause problems.")));
+	   // fall through for cleanup 
+        case XACT_EVENT_PARALLEL_PRE_COMMIT:
+	    // fall through
+        case XACT_EVENT_PRE_COMMIT:
+            tpc_commit();
+            cleanup();
+            break;
+        case XACT_EVENT_PARALLEL_ABORT:
+	    // fall through
+        case XACT_EVENT_ABORT:
+            tpc_rollback();
+            cleanup();
+            break;
+        default:
+            /* ignore */
+            break;
+    }
 }
 
 /* 
@@ -132,28 +180,4 @@ cleanup(void)
 }
 
 
-/* 
- * static void rollback()
- *
- * For the current transaction set, rolls all remote connections back
- * or at least tries to.  If the connection goes away and we have not
- * prepared the transaction, we don't need to worry about things because
- * the transaction will have disappeared too.
- */
-
-void
-rollback(void)
-{
-    struct conn *curr;
-    struct conn *head = txnset->head;
-
-
-    if (NULL == head)
-        return;
-    if (txnset)
-        tpc_rollback(txnset);
-    foreach (curr, head)
-        execorerr(curr, "ROLLBACK;", false);
-    txnset = NULL;
-}
 

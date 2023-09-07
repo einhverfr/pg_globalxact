@@ -32,13 +32,22 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <utils/builtins.h>
+#include <postmaster/bgworker.h>
 
 PG_MODULE_MAGIC;
 
+//PG_FUNCTION_INFO_V1(tpc_txnset_contents);
 static const char phasefmt[] = "phase %s\n";
 static const char actionfmt[] = "%s postgresql://%s:%s/%s %s %s\n";
 static const char getactionfmt[] = "%s %s %s %s";
 static const char dirpath[] = "extglobalxact";
+static const char preparefmt[] = "PREPARE TRANSACTION '%s'";
+static const char commitfmt[] = "COMMIT PREPARED '%s'";
+static const char rollbackfmt[] = "ROLLBACK PREPARED '%s'";
+const static char checkfmt[] = "SELECT * FROM pg_prepared_xacts "
+		               "WHERE gid = '%s'";
+
+static void tpc_register_bgworker(const char *fname);
 
 /*Max length of file line.  Going with 512 becaus connection strings in theory could be up to 255 characters long.
  */
@@ -47,8 +56,12 @@ static const char dirpath[] = "extglobalxact";
 tpc_txnset *tpc_txnset_from_file(const char *local_globalid);
 void	    tpc_txnsetfile_start(tpc_txnset * txnset, const char *local_globalid);
 void	    tpc_txnsetfile_write_phase(tpc_txnset * txnset, tpc_phase next_phase);
-void	    tpc_txnsetfile_write_action(tpc_txnset * txnset, tpc_txn * txn, const char *action);
+void	    tpc_txnsetfile_write_action(tpc_txnset * txnset, tpc_txn * txn, const char *status);
 void	    tpc_txnsetfile_complete(tpc_txnset * txnset);
+void        tpc_bgworker(Datum unused);
+void        tpc_process_file(char *fname);
+static void bg_cleanup(tpc_txnset *txnset, bool rollback);
+static bool check_txn(tpc_txnset *txnset, tpc_txn *last, tpc_txn *curr);
 
 
 /*
@@ -119,8 +132,8 @@ tpc_txnset
 			    connectionstr, linebuff)));
 		continue;
 	    }
-	    txn->cnx = PQconnectdb(connectionstr);
-	    strncpy(txn->txn_name, txnname, sizeof(txn->txn_name));
+	    txn->conn= PQconnectdb(connectionstr);
+	    strncpy(txnset->txn_prefix, txnname, sizeof(txnset->txn_prefix));
 	    if (txnset->head) {
 		txnset->latest->next = txn;
 		txnset->latest = txn;
@@ -176,7 +189,7 @@ tpc_txnsetfile_write_phase(tpc_txnset * txnset, tpc_phase phase)
 }
 
 /*
- * void tpc_txnsetfile_write_actoin(tpc_txnset *txnset, tpc_phase phase, tpc_txn *txn, const char *action)
+ * void tpc_txnsetfile_write_action(tpc_txnset *txnset, tpc_phase phase, tpc_txn *txn, const char *status)
  *
  * Writes the action, state, etc to the transactionset file.
  *
@@ -189,10 +202,10 @@ tpc_txnsetfile_write_action(tpc_txnset * txnset, tpc_txn * txn, const char *stat
 
     fprintf(txnset->log, actionfmt,
 	tpc_phase_get_label(txnset->tpc_phase),
-	PQhost(txn->cnx),
-	PQport(txn->cnx),
-	PQdb(txn->cnx),
-	txn->txn_name,
+	PQhost(txn->conn),
+	PQport(txn->conn),
+	PQdb(txn->conn),
+	txnset->txn_prefix,
 	status);
     fflush(txnset->log);
 }
@@ -211,7 +224,7 @@ tpc_txnsetfile_complete(tpc_txnset * txnset)
 		errmsg("Transaction not compplete!, state is %s", tpc_phase_get_label(txnset->tpc_phase))));
 
     fclose(txnset->log);
-    unlink(txnset->logfile);
+    unlink(txnset->logpath);
 }
 
 
@@ -244,29 +257,28 @@ tpc_cleanup_txnset(PG_FUNCTION_ARGS) {
 /* not optimizing this size-wise */
 
 typedef struct info_line {
-    char       *host, int port, char *database, char *status_label
-};
+    char       *host; int port; char *database; char *status_label;
+} info_line;
 
 
 
-PG_FUNCTION_INFO_V1(tpc_txnset_contents);
 
 /* State so we don't have to keep re-reading the file for each line
  * Using value_per_call mode here.  It is not terribly hard to do it
  * in this case.  Right now this still doesn't work (still needs
  * some of the tuple constructor parts done).  But will be completed
  * soon, after basic test programs are done.
- */
 Datum
 tpc_txnset_contents(PG_FUNCTION_ARGS) {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
     MemoryContext per_query_ctx;
     MemoryContext oldcontext;
-    info_line  return_next;
+    //info_line  return_next;
     tpc_txnset *txnset_new;
     char *gtlxid = PG_GETARG_CSTRING(0);
 
     /* check to see if caller supports us returning a tuplestore */
+    /*
     if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 	ereport(ERROR,
 	    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -279,15 +291,16 @@ tpc_txnset_contents(PG_FUNCTION_ARGS) {
     /*
      * need to set up per statement memory context here for the txnset
      */
+    /*
     per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 
     oldcontext = MemoryContextSwitchTo(per_query_ctx);
 
     if (SRF_IS_FIRSTCALL()){
-        functx = SRF_FIRSTCALL_INIT();
-	txnset_new = palloc(sizeof tpc_txnset);
-    	txnset_new = tpc_txnset_fromIfile(gtlxid);
-	memcpy(txnset, txnset_new, sizeof(txnset));
+       // functx = SRF_FIRSTCALL_INIT();
+	txnset_new = palloc0(sizeof(tpc_txnset));
+    	txnset_new = tpc_txnset_from_file(gtlxid);
+	memcpy(txnset, txnset_new, sizeof(&txnset));
     }
 
     /*
@@ -297,15 +310,15 @@ tpc_txnset_contents(PG_FUNCTION_ARGS) {
         // build the tuple and return it
     //    info_line.host info_line.port info_line.database info_line.status_label;
     /* Finally, close, and return end */
-    MemoryContextSwitchTo(old_context);
-    SRF_RETURN_DONE(per_query_ctx);
+    /*MemoryContextSwitchTo(oldcontext);
+    //SRF_RETURN_DONE(per_query_ctx); // not working yet anyway
 }
 
 /* 
  * Rolls back the transaction by name on a connection
  * Writes data to rollback segment of pending transaction log.
  */
-static tpc_phase
+tpc_phase
 tpc_rollback()
 {
 	bool can_complete = true;
@@ -323,61 +336,21 @@ tpc_rollback()
 		PGresult *res;
 		char rollback_query[128];
 		snprintf(rollback_query, sizeof(rollback_query), 
-			rollbackfmt, curr->txn_name);
-		res = PQexec(curr->cnx, rollback_query);
+			rollbackfmt, txnset->txn_prefix);
+		res = PQexec(curr->conn, rollback_query);
 
 		/* We are not allowed to throw errors here, but we can flag
 		 * the run as impossible to complete.
 		 */
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			can_complete = false;
-		tpc_txnsetfile_write_action(txnset, curr, ROLLBACK, 
+		tpc_txnsetfile_write_action(txnset, curr, 
 				(PQresultStatus(res) == PGRES_COMMAND_OK
 				? "OK" : "BAD"));
 	}
-	complete(txnset, can_complete);
+	if (can_complete)
+		tpc_txnsetfile_complete(txnset);
 	return txnset->tpc_phase;
-}
-
-/* statuc void txn_ceanup(XactEvent event, void *arg)
- *
- * This is the primary event handler for commit and
- * rollback.  It hides the tpc semantics behind those of
- * the local transactional semantics.
- */
-
-
-static void
-txn_cleanup(XactEvent event, void *arg)
-{
-    switch (event)
-    {
-        case XACT_EVENT_PREPARE:
-        case XACT_EVENT_PRE_PREPARE:
-            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Two phase commit not supported yet")));
-            break;
-        case XACT_EVENT_PARALLEL_COMMIT:
-        case XACT_EVENT_COMMIT:
-	    /* The problem is that if something goes wrong, here it is too late
-	     * roll back.  Consequently this warning is because it is not safe.
-	     */
-            ereport(WARNING,
-                    (errmsg("%s", "you are committing a remote transaction implicitly.  This can cause problems.")));
-/* fall through for cleanup */
-        case XACT_EVENT_PARALLEL_PRE_COMMIT:
-        case XACT_EVENT_PRE_COMMIT:
-            tpc_commit();
-            cleanup();
-            break;
-        case XACT_EVENT_PARALLEL_ABORT:
-        case XACT_EVENT_ABORT:
-            tpc_rollback();
-            cleanup();
-            break;
-        default:
-            /* ignore */
-            break;
-    }
 }
 
 /*
@@ -407,7 +380,7 @@ tpc_commit()
 		PGresult *res;
 		char commit_query[128];
 		snprintf(commit_query, sizeof(commit_query), 
-			commitfmt, curr->txn_name);
+			commitfmt, txnset->txn_prefix);
 		res = PQexec(curr->conn, commit_query);
 
 		/* We are not allowed to throw errors here, but we can flag
@@ -415,11 +388,161 @@ tpc_commit()
 		 */
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			can_complete = false;
-		tpc_txnsetfile_write_action(txnset, curr, COMMIT,
+		tpc_txnsetfile_write_action(txnset, curr,
 				(PQresultStatus(res) == PGRES_COMMAND_OK
 				? "OK" : "BAD"));
 	}
-	complete(txnset, can_complete);
+	if (can_complete)
+		tpc_txnsetfile_complete(txnset);
 	return txnset->tpc_phase;
 }
 
+/*
+ * Registeres a background worker to process the file.
+ *
+ * We use the bgw_extra field to point to the file rather than using the
+ * arg struct.
+ *
+ */
+
+static void
+tpc_register_bgworker(const char *fname)
+{
+        BackgroundWorkerHandle *bgwhandle = NULL;
+        BackgroundWorker *bgw = palloc0(sizeof(bgw));
+        snprintf(bgw->bgw_name, sizeof(bgw->bgw_name),
+                "TPC Cleanup %s", fname);
+        strncpy(bgw->bgw_library_name, "pg_globalxact.sl",
+                sizeof(bgw->bgw_library_name));
+        strncpy(bgw->bgw_function_name, "tpc_bgworker",
+               sizeof(bgw->bgw_function_name));
+        bgw->bgw_restart_time = 60;
+        strncpy(bgw->bgw_extra, fname, sizeof(bgw->bgw_extra));
+        bgw->bgw_main_arg = 0;
+        bgw->bgw_notify_pid = 0;
+        if (!RegisterDynamicBackgroundWorker(bgw, &bgwhandle)){
+                ereport(WARNING, (errmsg(
+                        "could not start worker for %s, "
+                        "Manual cleanup required.", fname)));
+        }
+        return;
+}
+
+
+void
+tpc_bgworker(Datum unused)
+{
+	tpc_process_file(MyBgworkerEntry->bgw_extra);
+	return;
+}
+
+void
+tpc_process_file(char *fname)
+{
+	tpc_txnset *txnset;
+	txnset = tpc_txnset_from_file(fname);
+	bg_cleanup(txnset, txnset->tpc_phase != COMMIT);
+	unlink(txnset->logpath);
+	return;
+}
+
+
+/* This is the bg_cleanup process which runs once the txnset has been
+ * initialized.  It repeatedly loops through the transactions.  If the
+ * transactions no longer exist or if they can be brought to completion
+ * they are removed from the list.
+ *
+ * When all transactions are removed from the list, we exit.
+ *
+ * If rollback is false we commit transactions
+ * and if true we roll them back.
+ */
+static void
+bg_cleanup(tpc_txnset *txnset, bool rollback)
+{
+	tpc_txn *last = NULL;
+	tpc_txn *curr;
+	PGresult *res;
+	do {
+		/* check to see if we are in a re-run and if so sleep */
+		if (txnset->tpc_phase == INCOMPLETE)
+			sleep(1);
+
+		curr = txnset->head;
+		for (curr = txnset->head; curr; curr = curr->next){
+			char query[128];
+			ereport(WARNING, (errmsg("cleaning up xact %s", txnset->txn_prefix)));
+
+			/* The connection may have gone away so we had
+			 * better check its status and reset if needed
+			 */
+			if (PQstatus(curr->conn) == CONNECTION_BAD)
+				PQreset(curr->conn);
+
+			if (check_txn(txnset, last, curr))
+				continue;
+
+
+			if (rollback)
+				snprintf(query, sizeof(query), 
+					rollbackfmt, txnset->txn_prefix);
+			else
+				snprintf(query, sizeof(query), 
+					commitfmt, txnset->txn_prefix);
+			
+			res = PQexec(curr->conn, query);
+
+			/* if successful, remove this from list */
+			if (PQresultStatus(res) == PGRES_COMMAND_OK)
+				if (last)
+					last->next = curr->next;
+				else
+					txnset->head = curr->next;
+			else
+				last = curr;
+		}
+		txnset->tpc_phase = INCOMPLETE;
+
+	} while (txnset->head);
+
+}
+
+/* Checks to see if a txn exists.  If the query succeeds and the transaction
+ * does not exist then this returns true and removes the transaction from
+ * the transaction set.
+ *
+ * Otherwise return false so the cleanup will try to remove the transaction,
+ */
+static bool
+check_txn(tpc_txnset *txnset, tpc_txn *last, tpc_txn *curr)
+{
+	char query[128];
+	PGresult *res;
+	bool removed = false;
+	snprintf(query, sizeof(query), 
+		checkfmt, txnset->txn_prefix);
+	
+	res = PQexec(curr->conn, query);
+	if ((PQresultStatus(res) != PGRES_TUPLES_OK) && (PQresultStatus(res) != PGRES_COMMAND_OK)){
+		ereport(INFO, (errmsg("Transaction %s query failed", txnset->txn_prefix)));
+		removed = false;
+	}
+	else if (PQntuples(res) >= 1){
+		removed = false;
+		ereport(WARNING, (errmsg("Transaction %s found %d times", txnset->txn_prefix, PQntuples(res))));
+	} else {
+		/* txns are palloced so no need to free. 
+		 * Besides process dies as soon as we complete
+		 * cleanup anyway
+		 */
+		ereport(INFO, (errmsg("Transaction %s not found", txnset->txn_prefix)));
+		PQfinish(curr->conn);
+		if (last)
+			last->next = curr->next;
+		else
+			txnset->head = curr->next;
+		removed = true;
+	}
+	PQclear(res);
+	return removed;
+}
