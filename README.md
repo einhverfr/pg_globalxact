@@ -3,6 +3,19 @@ NAME:
 
 SYNOPSIS:
 
+#include<postgres.h>
+
+PG\_MODULE\_MAGIC;
+
+const char libname = LIBDIR "/pg\_globalxact.so";
+
+void * regfunc = load\_external\_function(libname, "tpc\_register", true, NULL);
+
+/* do some things */
+
+/* In the transaction, if we have a libpq connection handle called conn */
+     regfunc(conn);
+
 DESCRIPTION:
 
 This extension provides services for doing destributed transactions within
